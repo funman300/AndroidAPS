@@ -1,0 +1,94 @@
+name: Sync Upstream & Trigger Release
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # Daily at 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write  # required to trigger workflow_dispatch on auto-release.yml
+
+env:
+  GITEA_URL: https://git.aleshym.co
+  # Set these as GitHub repository variables (Settings → Variables):
+  #   GITEA_OWNER  — your Gitea username or org
+  #   GITEA_REPO   — the repo name on Gitea (e.g. AndroidAPS)
+  # Set this as a GitHub secret (Settings → Secrets):
+  #   GITEA_TOKEN  — Gitea access token with write:repository scope
+
+jobs:
+  sync:
+    name: Sync Fork with Upstream
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/nightscout/AndroidAPS.git
+          git fetch upstream --tags
+
+      - name: Sync master branch
+        run: |
+          git checkout master
+          if git merge upstream/master --ff-only; then
+            echo "✅ Fast-forward merge succeeded."
+          else
+            echo "⚠️ Fast-forward not possible, doing regular merge..."
+            git merge upstream/master -m "chore: sync with upstream master"
+          fi
+          git push origin master
+          echo "✅ master synced with upstream."
+
+      - name: Detect new upstream tags and trigger release builds
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+          GITEA_OWNER: ${{ vars.GITEA_OWNER }}
+          GITEA_REPO: ${{ vars.GITEA_REPO }}
+        run: |
+          echo "🔍 Fetching existing Gitea releases..."
+
+          RELEASED=$(curl -sf \
+            -H "Authorization: token $GITEA_TOKEN" \
+            "$GITEA_URL/api/v1/repos/$GITEA_OWNER/$GITEA_REPO/releases?limit=200" \
+            | jq -r '.[].tag_name' 2>/dev/null || true)
+
+          echo "🔍 Checking for upstream tags not yet released on Gitea..."
+
+          NEW_TAGS=()
+          while IFS= read -r TAG; do
+            if echo "$RELEASED" | grep -qx "$TAG"; then
+              echo "ℹ️ $TAG already released — stopping search."
+              break
+            fi
+            NEW_TAGS+=("$TAG")
+          done < <(git tag -l --sort=-version:refname | grep -E '^[0-9]+\.[0-9]+\.[0-9]+')
+
+          if [ ${#NEW_TAGS[@]} -eq 0 ]; then
+            echo "✅ Gitea is up-to-date — no new upstream versions to release."
+            exit 0
+          fi
+
+          echo "🆕 New upstream tags: ${NEW_TAGS[*]}"
+
+          # Build newest first; cap at 3 to avoid burning too many CI minutes in one run
+          COUNT=0
+          for TAG in "${NEW_TAGS[@]}"; do
+            if [ $COUNT -ge 3 ]; then
+              echo "⚠️ Capped at 3 builds per sync run. Trigger auto-release.yml manually for older tags."
+              break
+            fi
+            echo "🚀 Triggering auto-release for $TAG..."
+            gh workflow run auto-release.yml --field tagName="$TAG"
+            COUNT=$((COUNT + 1))
+          done

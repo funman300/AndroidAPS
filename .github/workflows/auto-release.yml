@@ -1,0 +1,240 @@
+name: Auto Release for Obtainium
+
+# Triggered automatically by sync-upstream.yml when a new upstream tag is detected,
+# or manually to build and publish any upstream AAPS tag.
+#
+# Signed APKs are published as releases on the private Gitea repo at git.aleshym.co.
+# Obtainium reads from that private repo using a Gitea access token.
+#
+# Required GitHub Secrets:
+#   KEYSTORE_SET   — base64(keystore_b64|store_pass|alias|key_pass)  [or individual secrets]
+#   GITEA_TOKEN    — Gitea token with write:repository scope
+#
+# Required GitHub Variables (Settings → Variables → Repository variables):
+#   GITEA_OWNER    — Gitea username or organisation
+#   GITEA_REPO     — Gitea repository name (e.g. AndroidAPS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tagName:
+        description: 'AAPS upstream version tag to build (e.g. 3.4.2.2)'
+        required: true
+        type: string
+      buildVariant:
+        description: 'Build variant'
+        required: true
+        default: 'fullRelease'
+        type: choice
+        options:
+          - fullRelease
+          - fullDebug
+          - aapsclientRelease
+          - aapsclientDebug
+          - aapsclient2Release
+          - aapsclient2Debug
+          - pumpcontrolRelease
+          - pumpcontrolDebug
+
+env:
+  GITEA_URL: https://git.aleshym.co
+
+jobs:
+  build-release:
+    name: Build & Publish to Gitea
+    runs-on: ubuntu-latest
+    steps:
+      # ── Keystore ────────────────────────────────────────────────────────────
+      - name: Decode keystore secrets
+        run: |
+          if [ -n "${{ secrets.KEYSTORE_SET }}" ]; then
+            DECODED=$(echo "${{ secrets.KEYSTORE_SET }}" | base64 -d)
+            KEYSTORE_BASE64=$(echo "$DECODED" | cut -d'|' -f1)
+            KEYSTORE_PASSWORD=$(echo "$DECODED" | cut -d'|' -f2)
+            KEY_ALIAS=$(echo "$DECODED" | cut -d'|' -f3)
+            KEY_PASSWORD=$(echo "$DECODED" | cut -d'|' -f4)
+            echo "✅ Keystore extracted from KEYSTORE_SET"
+          else
+            KEYSTORE_BASE64="${{ secrets.KEYSTORE_BASE64 }}"
+            KEYSTORE_PASSWORD="${{ secrets.KEYSTORE_PASSWORD }}"
+            KEY_ALIAS="${{ secrets.KEY_ALIAS }}"
+            KEY_PASSWORD="${{ secrets.KEY_PASSWORD }}"
+            echo "ℹ️ Using individual keystore secrets"
+          fi
+          echo "KEYSTORE_BASE64=$KEYSTORE_BASE64" >> $GITHUB_ENV
+          echo "KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD" >> $GITHUB_ENV
+          echo "KEY_ALIAS=$KEY_ALIAS" >> $GITHUB_ENV
+          echo "KEY_PASSWORD=$KEY_PASSWORD" >> $GITHUB_ENV
+          echo "::add-mask::$KEYSTORE_BASE64"
+          echo "::add-mask::$KEYSTORE_PASSWORD"
+          echo "::add-mask::$KEY_ALIAS"
+          echo "::add-mask::$KEY_PASSWORD"
+
+      - name: Check keystore secrets
+        run: |
+          MISSING=0
+          check() { [ -z "$1" ] && echo "❌ Missing: $2" && MISSING=1; }
+          check "$KEYSTORE_BASE64"  "KEYSTORE_BASE64"
+          check "$KEYSTORE_PASSWORD" "KEYSTORE_PASSWORD"
+          check "$KEY_ALIAS"        "KEY_ALIAS"
+          check "$KEY_PASSWORD"     "KEY_PASSWORD"
+          [ "$MISSING" -eq 1 ] && exit 1
+          echo "✅ All keystore secrets present."
+
+      - name: Decode keystore file
+        run: |
+          mkdir -p "$RUNNER_TEMP/keystore"
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/keystore/keystore.jks"
+
+      - name: Validate keystore
+        run: |
+          echo "test" > dummy.txt && zip -q dummy.jar dummy.txt && rm dummy.txt
+          LOG=$(mktemp)
+          if ! jarsigner \
+              -keystore "$RUNNER_TEMP/keystore/keystore.jks" \
+              -storepass "$KEYSTORE_PASSWORD" \
+              -keypass "$KEY_PASSWORD" \
+              dummy.jar "$KEY_ALIAS" > "$LOG" 2>&1; then
+            echo "❌ Keystore validation failed:"; cat "$LOG"
+            rm -f "$LOG" dummy.jar; exit 1
+          fi
+          rm -f "$LOG" dummy.jar
+          echo "✅ Keystore validated."
+
+      # ── Source ──────────────────────────────────────────────────────────────
+      - name: Checkout fork at HEAD (reads jdk-map.json before tag switch)
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream tag
+        run: |
+          git remote add upstream https://github.com/nightscout/AndroidAPS.git || true
+          git fetch upstream "refs/tags/${{ github.event.inputs.tagName }}:refs/tags/${{ github.event.inputs.tagName }}"
+          echo "✅ Fetched tag ${{ github.event.inputs.tagName }} from upstream."
+
+      - name: Determine JDK version from jdk-map.json
+        run: |
+          TAG="${{ github.event.inputs.tagName }}"
+          JAVA_VERSION=$(jq -r '.default' .github/jdk-map.json)
+          while IFS=$'\t' read -r pattern jdk; do
+            [[ "$TAG" == $pattern ]] && JAVA_VERSION="$jdk" && break
+          done < <(jq -r '.mappings[] | "\(.pattern)\t\(.jdk)"' .github/jdk-map.json)
+          echo "JAVA_VERSION=$JAVA_VERSION" >> $GITHUB_ENV
+          echo "ℹ️ Tag $TAG → JDK $JAVA_VERSION"
+
+      - name: Switch to upstream tag
+        run: |
+          git checkout "refs/tags/${{ github.event.inputs.tagName }}"
+          echo "✅ Checked out ${{ github.event.inputs.tagName }}"
+
+      # ── Build env ────────────────────────────────────────────────────────────
+      - name: Set build variant env vars
+        run: |
+          BUILD_VARIANT="${{ github.event.inputs.buildVariant }}"
+          VARIANT_FLAVOR=$(echo "$BUILD_VARIANT" | sed -E 's/(Release|Debug)$//' | tr '[:upper:]' '[:lower:]')
+          VARIANT_TYPE=$(echo "$BUILD_VARIANT"  | grep -oE '(Release|Debug)$'    | tr '[:upper:]' '[:lower:]')
+          VERSION_SUFFIX=""
+          [[ "$VARIANT_FLAVOR" != "full" ]]   && VERSION_SUFFIX="$VARIANT_FLAVOR"
+          [[ "$VARIANT_TYPE"   == "debug" ]]  && VERSION_SUFFIX="${VERSION_SUFFIX}-debug"
+          [[ -n "$VERSION_SUFFIX" && "$VERSION_SUFFIX" != -* ]] && VERSION_SUFFIX="-$VERSION_SUFFIX"
+          echo "BUILD_VARIANT=$BUILD_VARIANT"     >> $GITHUB_ENV
+          echo "VARIANT_FLAVOR=$VARIANT_FLAVOR"   >> $GITHUB_ENV
+          echo "VARIANT_TYPE=$VARIANT_TYPE"       >> $GITHUB_ENV
+          echo "VERSION_SUFFIX=$VERSION_SUFFIX"   >> $GITHUB_ENV
+
+      - name: Extract VERSION from source
+        run: |
+          TAG="${{ github.event.inputs.tagName }}"
+          if echo "$TAG" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
+            VERSION="$TAG"
+          else
+            VERSION=$(grep 'val appVersion' buildSrc/src/main/kotlin/Versions.kt | awk -F '"' '{print $2}')
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      # ── Build ────────────────────────────────────────────────────────────────
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build APKs
+        run: |
+          ./gradlew :app:assemble${{ env.BUILD_VARIANT }} :wear:assemble${{ env.BUILD_VARIANT }} \
+            -Dorg.gradle.jvmargs="-Xmx8g -XX:+UseParallelGC -Xss1024m" \
+            -Dkotlin.daemon.jvm.options="-Xmx2g" \
+            -Dkotlin.compiler.execution.strategy="in-process" \
+            -Dorg.gradle.daemon=true \
+            -Dorg.gradle.workers.max=8 \
+            -Dorg.gradle.caching=true \
+            -Pandroid.injected.signing.store.file="$RUNNER_TEMP/keystore/keystore.jks" \
+            -Pandroid.injected.signing.store.password="$KEYSTORE_PASSWORD" \
+            -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$KEY_PASSWORD"
+
+      - name: Rename APKs with version
+        run: |
+          mv "app/build/outputs/apk/${{ env.VARIANT_FLAVOR }}/${{ env.VARIANT_TYPE }}"/*.apk \
+             "aaps-${{ env.VERSION }}${{ env.VERSION_SUFFIX }}.apk"
+          mv "wear/build/outputs/apk/${{ env.VARIANT_FLAVOR }}/${{ env.VARIANT_TYPE }}"/*.apk \
+             "aaps-wear-${{ env.VERSION }}${{ env.VERSION_SUFFIX }}.apk"
+
+      # ── Publish to Gitea ─────────────────────────────────────────────────────
+      - name: Create Gitea release and upload APKs
+        env:
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+          GITEA_OWNER: ${{ vars.GITEA_OWNER }}
+          GITEA_REPO:  ${{ vars.GITEA_REPO }}
+        run: |
+          TAG="${{ github.event.inputs.tagName }}"
+          VERSION="${{ env.VERSION }}"
+          SUFFIX="${{ env.VERSION_SUFFIX }}"
+          APK="aaps-${VERSION}${SUFFIX}.apk"
+          WEAR_APK="aaps-wear-${VERSION}${SUFFIX}.apk"
+          BASE="$GITEA_URL/api/v1/repos/$GITEA_OWNER/$GITEA_REPO"
+          AUTH="Authorization: token $GITEA_TOKEN"
+
+          echo "🔍 Checking if Gitea release $TAG already exists..."
+          EXISTING_ID=$(curl -sf -H "$AUTH" "$BASE/releases/tags/$TAG" | jq -r '.id // empty')
+
+          if [ -n "$EXISTING_ID" ]; then
+            echo "ℹ️ Release $TAG already exists (id=$EXISTING_ID) — uploading assets."
+            RELEASE_ID="$EXISTING_ID"
+          else
+            echo "📦 Creating Gitea release $TAG..."
+            BODY=$(jq -n \
+              --arg tag  "$TAG" \
+              --arg name "AAPS ${VERSION}${SUFFIX}" \
+              --arg body "Automated build of AAPS ${VERSION} from upstream nightscout/AndroidAPS." \
+              '{tag_name: $tag, name: $name, body: $body, draft: false, prerelease: false}')
+            RESPONSE=$(curl -sf -X POST -H "$AUTH" -H "Content-Type: application/json" \
+              "$BASE/releases" -d "$BODY")
+            RELEASE_ID=$(echo "$RESPONSE" | jq -r '.id')
+            echo "✅ Release created (id=$RELEASE_ID)"
+          fi
+
+          upload_asset() {
+            FILE="$1"
+            echo "⬆️ Uploading $FILE..."
+            HTTP=$(curl -s -w "%{http_code}" -o /tmp/gitea_upload.json \
+              -X POST -H "$AUTH" \
+              -F "attachment=@${FILE};type=application/vnd.android.package-archive" \
+              "$BASE/releases/$RELEASE_ID/assets?name=$(basename $FILE)")
+            if [[ "$HTTP" != "20"* ]]; then
+              echo "❌ Upload failed (HTTP $HTTP):"
+              cat /tmp/gitea_upload.json
+              exit 1
+            fi
+            echo "✅ Uploaded: $FILE"
+          }
+
+          upload_asset "$APK"
+          upload_asset "$WEAR_APK"
+
+          echo "🎉 Gitea release complete: $GITEA_URL/$GITEA_OWNER/$GITEA_REPO/releases/tag/$TAG"
