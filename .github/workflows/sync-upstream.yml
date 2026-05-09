@@ -89,6 +89,6 @@ jobs:
               break
             fi
             echo "🚀 Triggering auto-release for $TAG..."
-            gh workflow run auto-release.yml --field tagName="$TAG"
+            gh workflow run auto-release.yml --repo "$GITHUB_REPOSITORY" --field tagName="$TAG"
             COUNT=$((COUNT + 1))
           done
