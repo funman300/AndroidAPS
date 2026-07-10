@@ -14,8 +14,10 @@ env:
   # Set these as GitHub repository variables (Settings → Variables):
   #   GITEA_OWNER  — your Gitea username or org
   #   GITEA_REPO   — the repo name on Gitea (e.g. AndroidAPS)
-  # Set this as a GitHub secret (Settings → Secrets):
-  #   GITEA_TOKEN  — Gitea access token with write:repository scope
+  # Set these as GitHub secrets (Settings → Secrets):
+  #   GITEA_TOKEN          — Gitea access token with write:repository scope
+  #   WORKFLOW_PUSH_TOKEN  — fine-grained PAT (contents + workflows: write) so
+  #                          the sync can push upstream changes to workflow files
 
 jobs:
   sync:
@@ -26,6 +28,11 @@ jobs:
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
+          # GITHUB_TOKEN cannot push changes to .github/workflows/ (GitHub App
+          # tokens are hard-blocked from writing workflow files), so upstream
+          # merges touching CI files get rejected. WORKFLOW_PUSH_TOKEN must be
+          # a PAT with contents + workflows write on this repo.
+          token: ${{ secrets.WORKFLOW_PUSH_TOKEN || github.token }}
 
       - name: Configure git identity
         run: |
