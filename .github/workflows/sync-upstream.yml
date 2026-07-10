@@ -9,22 +9,16 @@ permissions:
   contents: write
   actions: write  # required to trigger workflow_dispatch on auto-release.yml
 
-env:
-  GITEA_URL: https://git.aleshym.co
-  # Set these as GitHub repository variables (Settings → Variables):
-  #   GITEA_OWNER  — your Gitea username or org
-  #   GITEA_REPO   — the repo name on Gitea (e.g. AndroidAPS)
-  # Set these as GitHub secrets (Settings → Secrets):
-  #   GITEA_TOKEN          — Gitea access token with write:repository scope
-  #   WORKFLOW_PUSH_TOKEN  — fine-grained PAT (contents + workflows: write) so
-  #                          the sync can push upstream changes to workflow files
+# Required GitHub secret (Settings → Secrets):
+#   WORKFLOW_PUSH_TOKEN — fine-grained PAT (contents + workflows: write) so
+#                         the sync can push upstream changes to workflow files
 
 jobs:
   sync:
-    name: Sync Fork with Upstream
+    name: Sync with Upstream
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout fork
+      - name: Checkout repo
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
@@ -59,18 +53,13 @@ jobs:
       - name: Detect new upstream tags and trigger release builds
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
-          GITEA_OWNER: ${{ vars.GITEA_OWNER }}
-          GITEA_REPO: ${{ vars.GITEA_REPO }}
         run: |
-          echo "🔍 Fetching existing Gitea releases..."
+          echo "🔍 Fetching existing GitHub releases..."
 
-          RELEASED=$(curl -sf \
-            -H "Authorization: token $GITEA_TOKEN" \
-            "$GITEA_URL/api/v1/repos/$GITEA_OWNER/$GITEA_REPO/releases?limit=200" \
-            | jq -r '.[].tag_name' 2>/dev/null || true)
+          RELEASED=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 \
+            --json tagName --jq '.[].tagName' 2>/dev/null || true)
 
-          echo "🔍 Checking for upstream tags not yet released on Gitea..."
+          echo "🔍 Checking for upstream tags not yet released..."
 
           NEW_TAGS=()
           while IFS= read -r TAG; do
@@ -82,7 +71,7 @@ jobs:
           done < <(git tag -l --sort=-version:refname | grep -E '^[0-9]+\.[0-9]+\.[0-9]+')
 
           if [ ${#NEW_TAGS[@]} -eq 0 ]; then
-            echo "✅ Gitea is up-to-date — no new upstream versions to release."
+            echo "✅ Releases are up-to-date — no new upstream versions to build."
             exit 0
           fi
 

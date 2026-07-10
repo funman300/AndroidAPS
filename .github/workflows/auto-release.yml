@@ -3,16 +3,11 @@ name: Auto Release for Obtainium
 # Triggered automatically by sync-upstream.yml when a new upstream tag is detected,
 # or manually to build and publish any upstream AAPS tag.
 #
-# Signed APKs are published as releases on the private Gitea repo at git.aleshym.co.
-# Obtainium reads from that private repo using a Gitea access token.
+# Signed APKs are published as GitHub releases on this (private) repo.
+# Obtainium reads them using a GitHub access token.
 #
 # Required GitHub Secrets:
 #   KEYSTORE_SET   — base64(keystore_b64|store_pass|alias|key_pass)  [or individual secrets]
-#   GITEA_TOKEN    — Gitea token with write:repository scope
-#
-# Required GitHub Variables (Settings → Variables → Repository variables):
-#   GITEA_OWNER    — Gitea username or organisation
-#   GITEA_REPO     — Gitea repository name (e.g. AndroidAPS)
 
 on:
   workflow_dispatch:
@@ -36,12 +31,12 @@ on:
           - pumpcontrolRelease
           - pumpcontrolDebug
 
-env:
-  GITEA_URL: https://git.aleshym.co
+permissions:
+  contents: write  # required to create releases and upload assets
 
 jobs:
   build-release:
-    name: Build & Publish to Gitea
+    name: Build & Publish Release
     runs-on: ubuntu-latest
     steps:
       # ── Keystore ────────────────────────────────────────────────────────────
@@ -185,56 +180,26 @@ jobs:
           mv "wear/build/outputs/apk/${{ env.VARIANT_FLAVOR }}/${{ env.VARIANT_TYPE }}"/*.apk \
              "aaps-wear-${{ env.VERSION }}${{ env.VERSION_SUFFIX }}.apk"
 
-      # ── Publish to Gitea ─────────────────────────────────────────────────────
-      - name: Create Gitea release and upload APKs
+      # ── Publish GitHub release ───────────────────────────────────────────────
+      - name: Create GitHub release and upload APKs
         env:
-          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
-          GITEA_OWNER: ${{ vars.GITEA_OWNER }}
-          GITEA_REPO:  ${{ vars.GITEA_REPO }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ github.event.inputs.tagName }}"
           VERSION="${{ env.VERSION }}"
           SUFFIX="${{ env.VERSION_SUFFIX }}"
           APK="aaps-${VERSION}${SUFFIX}.apk"
           WEAR_APK="aaps-wear-${VERSION}${SUFFIX}.apk"
-          BASE="$GITEA_URL/api/v1/repos/$GITEA_OWNER/$GITEA_REPO"
-          AUTH="Authorization: token $GITEA_TOKEN"
 
-          echo "🔍 Checking if Gitea release $TAG already exists..."
-          EXISTING_ID=$(curl -sf -H "$AUTH" "$BASE/releases/tags/$TAG" | jq -r '.id // empty')
-
-          if [ -n "$EXISTING_ID" ]; then
-            echo "ℹ️ Release $TAG already exists (id=$EXISTING_ID) — uploading assets."
-            RELEASE_ID="$EXISTING_ID"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "ℹ️ Release $TAG already exists — uploading assets."
           else
-            echo "📦 Creating Gitea release $TAG..."
-            BODY=$(jq -n \
-              --arg tag  "$TAG" \
-              --arg name "AAPS ${VERSION}${SUFFIX}" \
-              --arg body "Automated build of AAPS ${VERSION} from upstream nightscout/AndroidAPS." \
-              '{tag_name: $tag, name: $name, body: $body, draft: false, prerelease: false}')
-            RESPONSE=$(curl -sf -X POST -H "$AUTH" -H "Content-Type: application/json" \
-              "$BASE/releases" -d "$BODY")
-            RELEASE_ID=$(echo "$RESPONSE" | jq -r '.id')
-            echo "✅ Release created (id=$RELEASE_ID)"
+            echo "📦 Creating GitHub release $TAG..."
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "AAPS ${VERSION}${SUFFIX}" \
+              --notes "Automated build of AAPS ${VERSION} from upstream nightscout/AndroidAPS."
           fi
 
-          upload_asset() {
-            FILE="$1"
-            echo "⬆️ Uploading $FILE..."
-            HTTP=$(curl -s -w "%{http_code}" -o /tmp/gitea_upload.json \
-              -X POST -H "$AUTH" \
-              -F "attachment=@${FILE};type=application/vnd.android.package-archive" \
-              "$BASE/releases/$RELEASE_ID/assets?name=$(basename $FILE)")
-            if [[ "$HTTP" != "20"* ]]; then
-              echo "❌ Upload failed (HTTP $HTTP):"
-              cat /tmp/gitea_upload.json
-              exit 1
-            fi
-            echo "✅ Uploaded: $FILE"
-          }
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "$APK" "$WEAR_APK"
 
-          upload_asset "$APK"
-          upload_asset "$WEAR_APK"
-
-          echo "🎉 Gitea release complete: $GITEA_URL/$GITEA_OWNER/$GITEA_REPO/releases/tag/$TAG"
+          echo "🎉 Release complete: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
