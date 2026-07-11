@@ -203,3 +203,4 @@ jobs:
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "$APK" "$WEAR_APK"
 
           echo "🎉 Release complete: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
+
