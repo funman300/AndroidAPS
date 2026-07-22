@@ -181,7 +181,7 @@ jobs:
           echo "PR_REF_TYPE=$PR_REF_TYPE" >> $GITHUB_ENV
 
       - name: Checkout pull/${{ github.event.inputs.pr_number }}/${{ github.event.inputs.pr_ref_type }}
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           repository: ${{ github.event.inputs.repo }}
           ref: ${{ steps.pr_ref.outputs.ref_name }}
