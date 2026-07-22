@@ -1,0 +1,26 @@
+name: Set up AAPS build
+description: >-
+  Resolve the JDK version from .github/jdk-map.json, install it with the Gradle
+  cache enabled, and make gradlew executable. Shared by every verify.yml job so
+  the setup exists in exactly one place.
+
+runs:
+  using: composite
+  steps:
+    - name: Load JDK version from jdk-map.json
+      shell: bash
+      run: |
+        JAVA_VERSION=$(jq -r '.default' .github/jdk-map.json)
+        echo "Using JDK ${JAVA_VERSION}"
+        echo "JAVA_VERSION=${JAVA_VERSION}" >> "$GITHUB_ENV"
+
+    - name: Set up JDK
+      uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
+      with:
+        java-version: ${{ env.JAVA_VERSION }}
+        distribution: temurin
+        cache: gradle
+
+    - name: Grant execute permission for gradlew
+      shell: bash
+      run: chmod +x gradlew

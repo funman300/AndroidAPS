@@ -68,7 +68,11 @@ jobs:
       - name: Check keystore secrets
         run: |
           MISSING=0
-          check() { [ -z "$1" ] && echo "❌ Missing: $2" && MISSING=1; }
+          # NB: must not be an && chain. When the value IS present the chain
+          # returns non-zero, becomes the function's return status, and
+          # aborts the step under `bash -e` — silently. This guard only
+          # ever worked while a secret was missing.
+          check() { if [ -z "$1" ]; then echo "❌ Missing: $2"; MISSING=1; fi; }
           check "$KEYSTORE_BASE64"  "KEYSTORE_BASE64"
           check "$KEYSTORE_PASSWORD" "KEYSTORE_PASSWORD"
           check "$KEY_ALIAS"        "KEY_ALIAS"
