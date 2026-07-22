@@ -3,11 +3,16 @@ name: Auto Release for Obtainium
 # Triggered automatically by sync-upstream.yml when a new upstream tag is detected,
 # or manually to build and publish any upstream AAPS tag.
 #
-# Signed APKs are published as GitHub releases on this (private) repo.
-# Obtainium reads them using a GitHub access token.
+# Signed APKs are published as releases on the private Gitea repo at git.aleshym.co.
+# Obtainium reads from that private repo using a Gitea access token.
 #
 # Required GitHub Secrets:
 #   KEYSTORE_SET   — base64(keystore_b64|store_pass|alias|key_pass)  [or individual secrets]
+#   GITEA_TOKEN    — Gitea token with write:repository scope
+#
+# Required GitHub Variables (Settings → Variables → Repository variables):
+#   GITEA_OWNER    — Gitea username or organisation
+#   GITEA_REPO     — Gitea repository name (e.g. AndroidAPS)
 
 on:
   workflow_dispatch:
@@ -31,12 +36,12 @@ on:
           - pumpcontrolRelease
           - pumpcontrolDebug
 
-permissions:
-  contents: write  # required to create releases and upload assets
+env:
+  GITEA_URL: https://git.aleshym.co
 
 jobs:
   build-release:
-    name: Build & Publish Release
+    name: Build & Publish to Gitea
     runs-on: ubuntu-latest
     steps:
       # ── Keystore ────────────────────────────────────────────────────────────
@@ -69,9 +74,9 @@ jobs:
         run: |
           MISSING=0
           # NB: must not be an && chain. When the value IS present the chain
-          # returns non-zero, becomes the function's return status, and
-          # aborts the step under `bash -e` — silently. This guard only
-          # ever worked while a secret was missing.
+          # returns non-zero, and under `bash -e` that aborts the step
+          # silently — so this guard only ever worked when a secret was
+          # missing, and failed the build whenever all four were set.
           check() { if [ -z "$1" ]; then echo "❌ Missing: $2"; MISSING=1; fi; }
           check "$KEYSTORE_BASE64"  "KEYSTORE_BASE64"
           check "$KEYSTORE_PASSWORD" "KEYSTORE_PASSWORD"
@@ -102,7 +107,7 @@ jobs:
 
       # ── Source ──────────────────────────────────────────────────────────────
       - name: Checkout fork at HEAD (reads jdk-map.json before tag switch)
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
 
@@ -154,7 +159,7 @@ jobs:
 
       # ── Build ────────────────────────────────────────────────────────────────
       - name: Set up JDK
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
         with:
           java-version: ${{ env.JAVA_VERSION }}
           distribution: 'temurin'
@@ -184,27 +189,157 @@ jobs:
           mv "wear/build/outputs/apk/${{ env.VARIANT_FLAVOR }}/${{ env.VARIANT_TYPE }}"/*.apk \
              "aaps-wear-${{ env.VERSION }}${{ env.VERSION_SUFFIX }}.apk"
 
-      # ── Publish GitHub release ───────────────────────────────────────────────
-      - name: Create GitHub release and upload APKs
+      - name: Verify APK signing certificate
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXPECTED: ${{ vars.RELEASE_CERT_SHA256 }}
+        run: |
+          set -euo pipefail
+          BT="$(ls -1 "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
+          APKSIGNER="$ANDROID_HOME/build-tools/$BT/apksigner"
+          if [ ! -x "$APKSIGNER" ]; then
+            echo "❌ apksigner not found at $APKSIGNER"
+            exit 1
+          fi
+          echo "Using $APKSIGNER"
+
+          APK="aaps-${{ env.VERSION }}${{ env.VERSION_SUFFIX }}.apk"
+          WEAR_APK="aaps-wear-${{ env.VERSION }}${{ env.VERSION_SUFFIX }}.apk"
+          EXPECTED_LC="$(echo "${EXPECTED:-}" | tr 'A-F' 'a-f' | tr -d ' :')"
+
+          FAILED=0
+          for FILE in "$APK" "$WEAR_APK"; do
+            echo "🔍 Verifying $FILE"
+            if ! OUT="$("$APKSIGNER" verify --print-certs "$FILE" 2>&1)"; then
+              echo "❌ $FILE failed signature verification:"
+              echo "$OUT"
+              FAILED=1
+              continue
+            fi
+            echo "$OUT"
+            # Match the CERTIFICATE digest specifically: apksigner also prints a
+            # "public key SHA-256 digest" line, and a bare 'SHA-256 digest:'
+            # match only avoids it by luck of ordering. The `|| true` keeps a
+            # no-match from aborting the step under `set -e`, so the explicit
+            # "could not read" message below is actually reachable.
+            FP="$(echo "$OUT" | grep -i 'certificate SHA-256 digest:' | head -1 \
+                  | awk '{print $NF}' | tr 'A-F' 'a-f' | tr -d ' :' || true)"
+            if [ -z "$FP" ]; then
+              echo "❌ Could not read a certificate fingerprint from $FILE"
+              FAILED=1
+              continue
+            fi
+            if [ -z "$EXPECTED_LC" ]; then
+              echo "❌ Repository variable RELEASE_CERT_SHA256 is not set."
+              echo "   Observed fingerprint: $FP"
+              echo "   Once you have confirmed that is your real release key, set it under"
+              echo "   Settings → Secrets and variables → Actions → Variables."
+              FAILED=1
+              continue
+            fi
+            if [ "$FP" != "$EXPECTED_LC" ]; then
+              echo "❌ Signing certificate mismatch for $FILE"
+              echo "   expected: $EXPECTED_LC"
+              echo "   actual:   $FP"
+              echo "   Publishing this would break Obtainium updates for every existing install."
+              FAILED=1
+              continue
+            fi
+            echo "✅ $FILE is signed with the expected release certificate."
+          done
+          [ "$FAILED" -eq 0 ]
+
+      # ── Publish to Gitea ─────────────────────────────────────────────────────
+      - name: Create Gitea release and upload APKs
+        env:
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+          GITEA_OWNER: ${{ vars.GITEA_OWNER }}
+          GITEA_REPO:  ${{ vars.GITEA_REPO }}
         run: |
           TAG="${{ github.event.inputs.tagName }}"
           VERSION="${{ env.VERSION }}"
           SUFFIX="${{ env.VERSION_SUFFIX }}"
           APK="aaps-${VERSION}${SUFFIX}.apk"
           WEAR_APK="aaps-wear-${VERSION}${SUFFIX}.apk"
+          BASE="$GITEA_URL/api/v1/repos/$GITEA_OWNER/$GITEA_REPO"
+          AUTH="Authorization: token $GITEA_TOKEN"
 
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            echo "ℹ️ Release $TAG already exists — uploading assets."
+          # ── Build the release body ───────────────────────────────────────────
+          # Fetch a few recent releases and pick the newest that is not this tag,
+          # so a re-run against an existing release still compares against the
+          # genuine predecessor.
+          PREV=$(curl -sf -H "$AUTH" "$BASE/releases?limit=5" || echo '[]')
+
+          prev_size_of() {
+            echo "$PREV" | jq -r --arg n "$1" --arg t "$TAG" \
+              '[ .[] | select(.tag_name != $t) ] | .[0].assets[]? | select(.name == $n) | .size' \
+              | head -1
+          }
+
+          fmt_size() { awk -v s="$1" 'BEGIN{printf "%.2f MiB", s/1048576}'; }
+
+          fmt_delta() {
+            local now="$1" prev="$2"
+            if [ -z "$prev" ] || [ "$prev" = "null" ]; then echo "n/a"; return; fi
+            awk -v d="$((now - prev))" -v p="$prev" \
+              'BEGIN{printf "%+.2f MiB (%+.1f%%)", d/1048576, (p==0 ? 0 : 100*d/p)}'
+          }
+
+          {
+            printf 'Automated build of AAPS %s from upstream nightscout/AndroidAPS.\n\n' "$VERSION"
+            printf '| Asset | Size | Δ vs previous | SHA-256 |\n'
+            printf '| --- | --- | --- | --- |\n'
+            for FILE in "$APK" "$WEAR_APK"; do
+              NAME="$(basename "$FILE")"
+              SIZE="$(stat -c%s "$FILE")"
+              SHA="$(sha256sum "$FILE" | awk '{print $1}')"
+              printf '| `%s` | %s | %s | `%s` |\n' \
+                "$NAME" "$(fmt_size "$SIZE")" \
+                "$(fmt_delta "$SIZE" "$(prev_size_of "$NAME")")" "$SHA"
+            done
+          } > /tmp/release-body.md
+
+          RELEASE_BODY="$(cat /tmp/release-body.md)"
+          echo "Release body:"
+          cat /tmp/release-body.md
+
+          echo "🔍 Checking if Gitea release $TAG already exists..."
+          EXISTING_ID=$(curl -sf -H "$AUTH" "$BASE/releases/tags/$TAG" | jq -r '.id // empty')
+
+          if [ -n "$EXISTING_ID" ]; then
+            echo "ℹ️ Release $TAG already exists (id=$EXISTING_ID) — refreshing notes and uploading assets."
+            RELEASE_ID="$EXISTING_ID"
+            PATCH=$(jq -n --arg body "$RELEASE_BODY" '{body: $body}')
+            curl -sf -X PATCH -H "$AUTH" -H "Content-Type: application/json" \
+              "$BASE/releases/$RELEASE_ID" -d "$PATCH" >/dev/null
           else
-            echo "📦 Creating GitHub release $TAG..."
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
-              --title "AAPS ${VERSION}${SUFFIX}" \
-              --notes "Automated build of AAPS ${VERSION} from upstream nightscout/AndroidAPS."
+            echo "📦 Creating Gitea release $TAG..."
+            BODY=$(jq -n \
+              --arg tag  "$TAG" \
+              --arg name "AAPS ${VERSION}${SUFFIX}" \
+              --arg body "$RELEASE_BODY" \
+              '{tag_name: $tag, name: $name, body: $body, draft: false, prerelease: false}')
+            RESPONSE=$(curl -sf -X POST -H "$AUTH" -H "Content-Type: application/json" \
+              "$BASE/releases" -d "$BODY")
+            RELEASE_ID=$(echo "$RESPONSE" | jq -r '.id')
+            echo "✅ Release created (id=$RELEASE_ID)"
           fi
 
-          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "$APK" "$WEAR_APK"
+          upload_asset() {
+            FILE="$1"
+            echo "⬆️ Uploading $FILE..."
+            HTTP=$(curl -s -w "%{http_code}" -o /tmp/gitea_upload.json \
+              -X POST -H "$AUTH" \
+              -F "attachment=@${FILE};type=application/vnd.android.package-archive" \
+              "$BASE/releases/$RELEASE_ID/assets?name=$(basename $FILE)")
+            if [[ "$HTTP" != "20"* ]]; then
+              echo "❌ Upload failed (HTTP $HTTP):"
+              cat /tmp/gitea_upload.json
+              exit 1
+            fi
+            echo "✅ Uploaded: $FILE"
+          }
 
-          echo "🎉 Release complete: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
+          upload_asset "$APK"
+          upload_asset "$WEAR_APK"
 
+          echo "🎉 Gitea release complete: $GITEA_URL/$GITEA_OWNER/$GITEA_REPO/releases/tag/$TAG"
