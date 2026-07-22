@@ -104,7 +104,16 @@ jobs:
                  -H "Authorization: token $GITEA_TOKEN" "$URL")
           echo "GET $URL -> HTTP $CODE"
           case "$CODE" in
-            200) echo "✅ Gitea repo reachable: $GITEA_OWNER/$GITEA_REPO" ;;
+            200)
+              # An empty repo has no commit for a release tag to point at, so
+              # release creation fails later with an opaque error. Catch it here.
+              if [ "$(jq -r '.empty' < /tmp/gitea_probe.json)" = "true" ]; then
+                echo "::error::The Gitea repo $GITEA_OWNER/$GITEA_REPO is empty."
+                echo "A release tag needs a commit to point at. Push any commit"
+                echo "to it (a README is enough) and re-run."
+                exit 1
+              fi
+              echo "✅ Gitea repo reachable and non-empty: $GITEA_OWNER/$GITEA_REPO" ;;
             401|403)
               echo "::error::Gitea rejected the token (HTTP $CODE). Check GITEA_TOKEN and that it has the write:repository scope."
               cat /tmp/gitea_probe.json; exit 1 ;;
