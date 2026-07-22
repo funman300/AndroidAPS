@@ -1,8 +1,39 @@
 version: 2
 updates:
-- package-ecosystem: gradle
-  directory: "/"
-  schedule:
-    interval: daily
-  open-pull-requests-limit: 10
-  target-branch: dev
+
+  # Keep the pinned action SHAs fresh.
+  #
+  # This repo pins every external action to a full commit SHA, which is a
+  # fork-local divergence from upstream. Pins do not expire loudly — they just
+  # quietly get older — so without this they rot and the fork drifts further
+  # from upstream on exactly the lines upstream edits when it bumps an action.
+  #
+  # Weekly rather than daily, and a low PR cap: each PR triggers verify.yml,
+  # which is a full Android build.
+  - package-ecosystem: github-actions
+    directory: "/"
+    target-branch: master
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "ci"
+
+  # Gradle updates are deliberately NOT enabled.
+  #
+  # This repo tracks nightscout/AndroidAPS and merges it daily. Upstream owns
+  # its own dependency versions, so a fork-local bump to a build file collides
+  # with the next upstream change to the same file — and sync-upstream.yml has
+  # no way to resolve that automatically; it just files a conflict issue and
+  # stops syncing until a human intervenes.
+  #
+  # The previous config did list gradle, but pointed it at a `target-branch: dev`
+  # that does not exist in this repo, so it never actually ran. Enabling it for
+  # real would add a steady source of merge conflicts to the one part of this
+  # pipeline that needs a human. Let upstream manage app dependencies.
+  #
+  # - package-ecosystem: gradle
+  #   directory: "/"
+  #   target-branch: master
+  #   schedule:
+  #     interval: weekly
