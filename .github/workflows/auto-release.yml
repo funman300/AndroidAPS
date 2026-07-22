@@ -85,6 +85,37 @@ jobs:
           [ "$MISSING" -eq 1 ] && exit 1
           echo "✅ All keystore secrets present."
 
+      # Publishing is the last step of a ~20 minute build, so a bad token or a
+      # wrong repo path used to cost the whole build before surfacing. Check it
+      # up front instead.
+      - name: Check Gitea is reachable
+        env:
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+          GITEA_OWNER: ${{ vars.GITEA_OWNER }}
+          GITEA_REPO:  ${{ vars.GITEA_REPO }}
+        run: |
+          set -uo pipefail
+          if [ -z "${GITEA_TOKEN:-}" ]; then echo "::error::GITEA_TOKEN is not set."; exit 1; fi
+          if [ -z "${GITEA_OWNER:-}" ] || [ -z "${GITEA_REPO:-}" ]; then
+            echo "::error::GITEA_OWNER and/or GITEA_REPO variables are not set."; exit 1
+          fi
+          URL="$GITEA_URL/api/v1/repos/$GITEA_OWNER/$GITEA_REPO"
+          CODE=$(curl -s -o /tmp/gitea_probe.json -w '%{http_code}' \
+                 -H "Authorization: token $GITEA_TOKEN" "$URL")
+          echo "GET $URL -> HTTP $CODE"
+          case "$CODE" in
+            200) echo "✅ Gitea repo reachable: $GITEA_OWNER/$GITEA_REPO" ;;
+            401|403)
+              echo "::error::Gitea rejected the token (HTTP $CODE). Check GITEA_TOKEN and that it has the write:repository scope."
+              cat /tmp/gitea_probe.json; exit 1 ;;
+            404)
+              echo "::error::Gitea has no repo at $GITEA_OWNER/$GITEA_REPO (HTTP 404). Check the GITEA_OWNER and GITEA_REPO variables, or that the token can see it."
+              cat /tmp/gitea_probe.json; exit 1 ;;
+            *)
+              echo "::error::Unexpected response from Gitea (HTTP $CODE)."
+              cat /tmp/gitea_probe.json; exit 1 ;;
+          esac
+
       - name: Decode keystore file
         run: |
           mkdir -p "$RUNNER_TEMP/keystore"
@@ -318,9 +349,15 @@ jobs:
               --arg name "AAPS ${VERSION}${SUFFIX}" \
               --arg body "$RELEASE_BODY" \
               '{tag_name: $tag, name: $name, body: $body, draft: false, prerelease: false}')
-            RESPONSE=$(curl -sf -X POST -H "$AUTH" -H "Content-Type: application/json" \
+            HTTP=$(curl -s -w "%{http_code}" -o /tmp/gitea_release.json \
+              -X POST -H "$AUTH" -H "Content-Type: application/json" \
               "$BASE/releases" -d "$BODY")
-            RELEASE_ID=$(echo "$RESPONSE" | jq -r '.id')
+            if [[ "$HTTP" != "20"* ]]; then
+              echo "::error::Creating the Gitea release failed (HTTP $HTTP):"
+              cat /tmp/gitea_release.json
+              exit 1
+            fi
+            RELEASE_ID=$(jq -r '.id' < /tmp/gitea_release.json)
             echo "✅ Release created (id=$RELEASE_ID)"
           fi
 
