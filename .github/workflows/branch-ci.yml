@@ -149,7 +149,7 @@ jobs:
           echo "✅ Access token obtained."
 
       - name: Checkout source code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Load jdk versions
         run: |
