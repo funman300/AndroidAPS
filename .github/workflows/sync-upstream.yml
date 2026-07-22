@@ -9,17 +9,28 @@ permissions:
   contents: write
   actions: write  # required to trigger workflow_dispatch on auto-release.yml
 
-# Required GitHub secret (Settings → Secrets):
-#   WORKFLOW_PUSH_TOKEN — fine-grained PAT (contents + workflows: write) so
-#                         the sync can push upstream changes to workflow files
+env:
+  GITEA_URL: https://git.aleshym.co
+  # Set these as GitHub repository variables (Settings → Variables):
+  #   GITEA_OWNER  — your Gitea username or org
+  #   GITEA_REPO   — the repo name on Gitea (e.g. AndroidAPS)
+  # Set these as GitHub secrets (Settings → Secrets):
+  #   GITEA_TOKEN          — Gitea access token with write:repository scope
+  #   WORKFLOW_PUSH_TOKEN  — fine-grained PAT (contents + workflows: write) so
+  #                          the sync can push upstream changes to workflow files
 
 jobs:
   sync:
-    name: Sync with Upstream
+    name: Sync Fork with Upstream
     runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.sync.outputs.changed }}
+      range: ${{ steps.sync.outputs.range }}
+      after: ${{ steps.sync.outputs.after }}
+      conflict: ${{ steps.sync.outputs.conflict }}
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v5
+      - name: Checkout fork
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
           # GITHUB_TOKEN cannot push changes to .github/workflows/ (GitHub App
@@ -39,27 +50,50 @@ jobs:
           git fetch upstream --tags
 
       - name: Sync master branch
+        id: sync
         run: |
           git checkout master
+          BEFORE="$(git rev-parse HEAD)"
           if git merge upstream/master --ff-only; then
             echo "✅ Fast-forward merge succeeded."
           else
             echo "⚠️ Fast-forward not possible, doing regular merge..."
-            git merge upstream/master -m "chore: sync with upstream master"
+            if ! git merge upstream/master -m "chore: sync with upstream master"; then
+              echo "❌ Merge conflict with upstream master — aborting merge."
+              git merge --abort
+              echo "conflict=true" >> "$GITHUB_OUTPUT"
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
           fi
+          AFTER="$(git rev-parse HEAD)"
           git push origin master
-          echo "✅ master synced with upstream."
+          echo "conflict=false" >> "$GITHUB_OUTPUT"
+          echo "after=${AFTER}" >> "$GITHUB_OUTPUT"
+          if [ "$BEFORE" = "$AFTER" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "ℹ️ master was already up to date — no new upstream commits."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "range=${BEFORE}..${AFTER}" >> "$GITHUB_OUTPUT"
+            echo "✅ master synced with upstream (${BEFORE} → ${AFTER})."
+          fi
 
       - name: Detect new upstream tags and trigger release builds
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+          GITEA_OWNER: ${{ vars.GITEA_OWNER }}
+          GITEA_REPO: ${{ vars.GITEA_REPO }}
         run: |
-          echo "🔍 Fetching existing GitHub releases..."
+          echo "🔍 Fetching existing Gitea releases..."
 
-          RELEASED=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 \
-            --json tagName --jq '.[].tagName' 2>/dev/null || true)
+          RELEASED=$(curl -sf \
+            -H "Authorization: token $GITEA_TOKEN" \
+            "$GITEA_URL/api/v1/repos/$GITEA_OWNER/$GITEA_REPO/releases?limit=200" \
+            | jq -r '.[].tag_name' 2>/dev/null || true)
 
-          echo "🔍 Checking for upstream tags not yet released..."
+          echo "🔍 Checking for upstream tags not yet released on Gitea..."
 
           NEW_TAGS=()
           while IFS= read -r TAG; do
@@ -71,7 +105,7 @@ jobs:
           done < <(git tag -l --sort=-version:refname | grep -E '^[0-9]+\.[0-9]+\.[0-9]+')
 
           if [ ${#NEW_TAGS[@]} -eq 0 ]; then
-            echo "✅ Releases are up-to-date — no new upstream versions to build."
+            echo "✅ Gitea is up-to-date — no new upstream versions to release."
             exit 0
           fi
 
@@ -89,4 +123,105 @@ jobs:
             COUNT=$((COUNT + 1))
           done
 
+  verify:
+    name: Verify synced master
+    needs: sync
+    if: needs.sync.outputs.changed == 'true'
+    uses: ./.github/workflows/verify.yml
+    # A reusable workflow runs in the CALLER's context, so github.sha inside
+    # verify.yml is master's head from when this run was queued — i.e. before
+    # the sync job merged and pushed. Without an explicit ref it would check
+    # out and verify the already-green commit, reporting success no matter
+    # what the merge did.
+    with:
+      ref: ${{ needs.sync.outputs.after }}
 
+  report-failure:
+    name: Report broken sync
+    needs: [sync, verify]
+    # Anything that is not a clean pass and not a skip: covers 'failure' and
+    # also 'cancelled', which the shared concurrency group makes reachable.
+    if: always() && needs.verify.result != 'success' && needs.verify.result != 'skipped'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the breakage issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # This job has no checkout, so gh cannot resolve a repository from
+          # git remotes; without GH_REPO every gh call here aborts.
+          GH_REPO: ${{ github.repository }}
+          RANGE: ${{ needs.sync.outputs.range }}
+          RESULT: ${{ needs.verify.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TITLE="Upstream sync broke the build"
+          {
+            echo "Verification did not pass after syncing upstream \`nightscout/AndroidAPS\`."
+            echo
+            echo "- Verification result: \`${RESULT}\`"
+            echo "- Merged range: \`${RANGE}\`"
+            echo "- Run: ${RUN_URL}"
+            echo
+            echo "\`master\` is not currently known to build."
+          } > /tmp/body.md
+
+          EXISTING=$(gh issue list --state open --search "\"$TITLE\" in:title" \
+            --json number,title \
+            --jq ".[] | select(.title == \"${TITLE}\") | .number" | head -1)
+
+          if [ -n "$EXISTING" ]; then
+            echo "Commenting on existing issue #${EXISTING}"
+            gh issue comment "$EXISTING" --body-file /tmp/body.md
+          else
+            echo "Opening a new issue"
+            gh issue create --title "$TITLE" --body-file /tmp/body.md
+          fi
+
+  report-conflict:
+    name: Report upstream conflict
+    needs: sync
+    if: needs.sync.outputs.conflict == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the conflict issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # No checkout in this job, so gh needs the repository named explicitly.
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TITLE="Upstream sync conflict"
+          {
+            echo "Merging \`nightscout/AndroidAPS@master\` into this fork's \`master\` conflicts."
+            echo "The merge was aborted and \`master\` was left unchanged, so the fork has"
+            echo "stopped tracking upstream until this is resolved by hand."
+            echo
+            echo "- Run: ${RUN_URL}"
+            echo
+            echo "Resolve locally:"
+            echo
+            echo '```bash'
+            echo "git fetch https://github.com/nightscout/AndroidAPS.git master"
+            echo "git checkout master"
+            echo "git merge FETCH_HEAD"
+            echo '```'
+            echo
+            echo "Action-version bumps are the likely cause: this fork pins every action"
+            echo "to a commit SHA, which diverges from upstream on exactly those lines."
+          } > /tmp/body.md
+
+          EXISTING=$(gh issue list --state open --search "\"$TITLE\" in:title" \
+            --json number,title \
+            --jq ".[] | select(.title == \"${TITLE}\") | .number" | head -1)
+
+          if [ -n "$EXISTING" ]; then
+            echo "Commenting on existing issue #${EXISTING}"
+            gh issue comment "$EXISTING" --body-file /tmp/body.md
+          else
+            echo "Opening a new issue"
+            gh issue create --title "$TITLE" --body-file /tmp/body.md
+          fi

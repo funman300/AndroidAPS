@@ -1,0 +1,92 @@
+name: Verify
+
+# Automated build verification for this fork.
+#
+# Every other build workflow here is workflow_dispatch-only, so nothing notices
+# when a commit breaks the build — and in practice the commits that land on
+# master are unattended daily merges from sync-upstream.yml.
+#
+# No secrets are referenced anywhere in this file. Debug variants are signed
+# with the standard debug key, which is what makes pull_request runs from forks
+# safe to execute.
+#
+# There is deliberately no ktlint job. A full-repo `ktlintCheck --continue` on
+# unmodified upstream code reports 94,345 violations across 3,249 files in every
+# module, so it cannot function as a gate. The cause looks like upstream config
+# rather than upstream code: .editorconfig still uses ktlint 0.x
+# `disabled_rules=` syntax, which ktlint 1.x (via plugin 14.0.1) ignores, so the
+# intended rule exclusions no longer apply and the stricter 1.x defaults flag a
+# codebase formatted under looser ones. Scoping the check to changed modules did
+# not help — every module is affected. Fix the .editorconfig upstream first if
+# this is ever wanted back.
+
+on:
+  pull_request:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit SHA to verify. Defaults to the triggering commit.
+        required: false
+        type: string
+  workflow_dispatch: {}
+
+concurrency:
+  group: verify-${{ inputs.ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Matches branch-ci.yml's tuning. -Xss1024m is load-bearing for Kotlin
+  # compilation of this codebase. GRADLE_OPTS is parsed by the gradle launcher,
+  # which respects the embedded quoting.
+  GRADLE_OPTS: >-
+    -Dorg.gradle.jvmargs="-Xmx8g -XX:+UseParallelGC -Xss1024m"
+    -Dkotlin.daemon.jvm.options="-Xmx2g"
+    -Dkotlin.compiler.execution.strategy=in-process
+    -Dorg.gradle.daemon=true
+    -Dorg.gradle.workers.max=8
+    -Dorg.gradle.caching=true
+
+jobs:
+  unit-tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Set up build
+        uses: ./.github/actions/setup-aaps-build
+
+      - name: Run unit tests
+        run: ./gradlew -PfirebaseDisable testFullDebugUnitTest
+
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: unit-test-reports
+          path: '**/build/reports/tests/**'
+          retention-days: 7
+          if-no-files-found: ignore
+
+  assemble:
+    name: Assemble
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Set up build
+        uses: ./.github/actions/setup-aaps-build
+
+      - name: Assemble debug APKs
+        run: ./gradlew -PfirebaseDisable :app:assembleFullDebug :wear:assembleFullDebug
